@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AmazingData 服务面板</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", monospace;
+         background:#0d1117; color:#c9d1d9; margin:0; padding:20px; }
+  h1 { font-size:18px; margin:0 0 14px; }
+  .grid { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:18px; }
+  .card { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:14px; min-width:115px; }
+  .card .k { font-size:12px; color:#8b949e; }
+  .card .v { font-size:22px; font-weight:600; margin-top:6px; }
+  .badge { display:inline-block; padding:3px 10px; border-radius:12px; font-size:13px; }
+  .ok { background:#1f6f3e; color:#fff; }
+  .bad { background:#8b2020; color:#fff; }
+  .logs { background:#010409; border:1px solid #30363d; border-radius:8px; padding:12px;
+          height:340px; overflow:auto; font-size:13px; line-height:1.6; white-space:pre-wrap;
+          font-family: "SF Mono", "Cascadia Code", Consolas, "Menlo", "Courier New", monospace; }
+  .logs div { margin:0; }
+  .logcols { display:flex; gap:12px; }
+  .logcol { flex:1; min-width:0; }
+  .loghead { font-size:13px; color:#8b949e; margin-bottom:6px; }
+  .sec-title { font-size:13px; color:#8b949e; margin:18px 0 8px; }
+  a { color:#58a6ff; }
+</style>
+</head>
+<body>
+  <h1>AmazingData HTTP 服务面板</h1>
+  <div class="grid">
+    <div class="card"><div class="k" style="color:#8b949e">状态</div><div class="v"><span id="status" class="badge ok">-</span></div></div>
+    <div class="card" title="HTTP 服务进程存活时长(仅服务真正重启/崩溃后归零; watchdog execv 自愈不归零)"><div class="k" style="color:#3fb950">服务运行时间</div><div class="v" id="service-uptime">-</div></div>
+    <div class="card" title="当前 TGW 登录会话时长(会话重新拉起/重登后归零)"><div class="k" style="color:#58a6ff">TGW 登录时间</div><div class="v" id="uptime">-</div></div>
+    <div class="card" title="最近一次成功请求时间(看门狗判活依据)"><div class="k" style="color:#58a6ff">最近成功请求</div>
+      <div class="v" style="font-size:16px;font-weight:600;line-height:1.35;text-align:left;white-space:nowrap;">
+        <div id="ls-date">-</div>
+        <div id="ls-time">-</div>
+      </div></div>
+    <div class="card"><div class="k" style="color:#58a6ff">总请求数</div><div class="v" id="requests">-</div></div>
+    <div class="card"><div class="k" style="color:#bc8cff">累计数据行</div><div class="v" id="rows">-</div></div>
+    <div class="card"><div class="k" style="color:#58a6ff">HTTP 请求流量</div><div class="v" id="bytes">-</div></div>
+    <div class="card"><div class="k" style="color:#3fb950">WS 推送流量</div><div class="v" id="ws">-</div></div>
+    <div class="card"><div class="k" style="color:#f85149">错误数</div><div class="v" id="errors">-</div></div>
+    <div class="card" title="进程 execv 自重启换 TGW 登录的累计次数(不含运维 systemctl restart)"><div class="k" style="color:#d29922">重启次数</div><div class="v" id="reconn">-</div></div>
+    <div class="card"><div class="k" style="color:#8b949e">本地缓存</div><div class="v" id="cache">-</div></div>
+    <div class="card" title="http server 进程自身占用(VmRSS)"><div class="k" style="color:#d29922">进程内存</div><div class="v" id="mem-rss">-</div></div>
+    <div class="card"><div class="k" style="color:#e3b341">内存占用(整机) <span id="mem-pct">-</span></div><div class="v" id="mem">-</div></div>
+    <div class="card" title="今日流量(每天0点重置, 跨重启保留)" style="padding:2px 14px;"><div class="v" style="font-size:14px;font-weight:500;line-height:1.9;text-align:left;white-space:nowrap;color:#8b949e;">
+        <div>今日 WS 流量 <span id="t-ws" style="float:right;margin-left:14px;color:#58a6ff;font-weight:600;">-</span></div>
+        <div>今日 HTTP 流量 <span id="t-http" style="float:right;margin-left:14px;color:#58a6ff;font-weight:600;">-</span></div>
+      </div></div>
+    <div class="card" title="今日请求统计(每天0点重置, 跨重启保留)" style="padding:2px 14px;"><div class="v" style="font-size:14px;font-weight:500;line-height:1.9;text-align:left;white-space:nowrap;color:#8b949e;">
+        <div>今日请求数 <span id="t-req" style="float:right;margin-left:14px;color:#58a6ff;font-weight:600;">-</span></div>
+        <div>今日数据行 <span id="t-rows" style="float:right;margin-left:14px;color:#58a6ff;font-weight:600;">-</span></div>
+      </div></div>
+  </div>
+  <div class="logcols">
+    <div class="logcol">
+      <div class="loghead">看门狗日志</div>
+      <div class="logs" id="logs-watchdog"></div>
+    </div>
+    <div class="logcol">
+      <div class="loghead">请求日志 (GET/POST)</div>
+      <div class="logs" id="logs-request"></div>
+    </div>
+    <div class="logcol">
+      <div class="loghead">后端数据日志</div>
+      <div class="logs" id="logs-backend"></div>
+    </div>
+  </div>
+  </div>
+  <div class="sec-title">
+    接口: POST /api/query &nbsp;|&nbsp; WS /ws/market &nbsp;|&nbsp; GET /api/stats &nbsp;|&nbsp; GET /health &nbsp;&nbsp; 看门狗: 检查 30s, 超时 900s 重启 / 180s 主动探测
+  </div>
+
+<script>
+// 各日志容器已渲染状态(boxId -> {count,first,last}), 须在 refresh() 之外保持,
+// 否则每次刷新重置为空, 增量追加逻辑失效(退化为每次全量重建 DOM)。
+const _rendered = {};
+function fmtUptime(s){
+  s = Math.max(0, s|0);
+  const d = Math.floor(s/86400); s%=86400;
+  const h = Math.floor(s/3600); s%=3600;
+  const m = Math.floor(s/60); const sec = s%60;
+  return (d?d+"d ":"")+h+"h "+m+"m "+sec+"s";
+}
+async function refresh(){
+  try{
+    const r = await fetch('/api/stats');
+    const s = await r.json();
+    const st = document.getElementById('status');
+    st.textContent = (s.status==='ok')?'正常':'降级'; st.className = 'badge ' + (s.status==='ok'?'ok':'bad');
+    document.getElementById('uptime').textContent = s.tgw_login_seconds != null ? fmtUptime(s.tgw_login_seconds) : '-';
+    document.getElementById('service-uptime').textContent = fmtUptime(s.service_uptime_seconds != null ? s.service_uptime_seconds : s.uptime_seconds);
+    const _lss = (s.last_success || '-').split(' ');
+    document.getElementById('ls-date').textContent = _lss[0] || '-';
+    document.getElementById('ls-time').textContent = _lss[1] || '-';
+    document.getElementById('requests').textContent = s.total_requests;
+    document.getElementById('rows').textContent = s.total_data_rows.toLocaleString();
+    document.getElementById('bytes').textContent = s.total_bytes_human || (s.total_bytes + ' B');
+    document.getElementById('ws').textContent = s.ws_bytes_human || (s.ws_bytes + ' B');
+    document.getElementById('errors').textContent = s.error_count;
+    document.getElementById('reconn').textContent = s.reconnect_count;
+    document.getElementById('cache').textContent =
+      s.cache_bytes_human || (s.cache_bytes + ' B');
+    document.getElementById('mem-pct').textContent = s.mem_total ? s.mem_used_pct + '%' : '-';
+    document.getElementById('mem-rss').textContent = s.mem_rss_human || (s.mem_rss + ' B');
+    const td = s.today || {};
+    document.getElementById('t-ws').textContent = td.ws_bytes_human || '0 B';
+    document.getElementById('t-http').textContent = td.http_bytes_human || '0 B';
+    document.getElementById('t-req').textContent = td.requests != null ? td.requests : '-';
+    document.getElementById('t-rows').textContent = td.rows != null ? td.rows.toLocaleString() : '-';
+    document.getElementById('mem').textContent = s.mem_total
+      ? s.mem_used_human + '/' + s.mem_total_human
+      : '-';
+    // 已渲染状态: 增量追加日志, 不做 innerHTML 整体重建。
+    // 整体重建会销毁用户正在选中的 DOM 节点, 导致选区失效/异常扩大(复制时"突然全选")。
+    function appendLine(box, l, stripWd){
+      // 看门狗视图只保留消息本体, 不显示来源标签与前缀
+      if(stripWd) l = l.replace(/\[watchdog\]\s*/gi, '').replace(/watchdog:\s*/gi, '');
+      const d = document.createElement('div');
+      d.style.color = logColor(l);
+      d.textContent = l;   // textContent 自动转义, 替代原 esc()
+      box.appendChild(d);
+    }
+    function fill(boxId, logs, stripWd){
+      const box = document.getElementById(boxId);
+      const n = logs.length;
+      const first = n ? logs[0] : null;
+      const last  = n ? logs[n-1] : null;
+      const prev = _rendered[boxId];
+      // 记录“改动前是否贴在底部”，因重建(innerHTML='')会清零 scrollTop，需据此决定是否回贴
+      const wasNearBottom = prev ? (box.scrollTop + box.clientHeight >= box.scrollHeight - 30) : false;
+      if(prev && prev.count === n && prev.first === first && prev.last === last) return;
+      if(prev && n >= prev.count && prev.count > 0 && first === prev.first){
+        // 纯追加: 只在末尾补新行, 已有 DOM(含选中文本)保持不动
+        for(let i=prev.count;i<n;i++) appendLine(box, logs[i], stripWd);
+      }else{
+        // 初始化 / 环形缓冲滚动(内容整体左移) / 回缩: 才整体重建
+        box.innerHTML = '';
+        for(let i=0;i<n;i++) appendLine(box, logs[i], stripWd);
+      }
+      _rendered[boxId] = {count:n, first:first, last:last};
+      // 首次渲染 或 之前贴在底部 → 自动贴底显示最新; 用户向上翻历史时不强行拉回
+      if(!prev || wasNearBottom){
+        box.scrollTop = box.scrollHeight;
+      }
+    }
+    // 按日志级别着色: ERROR 红 / WARNING 黄 / INFO 蓝 / 其他灰
+    function logColor(l){
+      if(l.indexOf('ws client disconnected')>=0) return '#d29922';
+      if(l.indexOf('ws client attached')>=0) return '#3fb950';
+      if(l.indexOf('tgw keepalive ok')>=0) return '#3fb950';
+      if(l.indexOf('ERROR')>=0 || l.indexOf('tgw keepalive failed')>=0) return '#f85149';
+      if(l.indexOf('WARNING')>=0) return '#d29922';
+      if(l.indexOf('INFO')>=0) return '#58a6ff';
+      return '#8b949e';
+    }
+    fill('logs-watchdog', s.logs_watchdog || [], true);
+    fill('logs-backend', s.logs_backend || s.logs || []);
+    fill('logs-request', s.logs_request || []);
+  }catch(e){
+    const box=document.getElementById('logs-backend');
+    box.innerHTML = '<div style="color:#f85149">⚠️ 连接行情服务失败，无法刷新运行数据。<br>'+
+      '页面会每 2 秒自动重试；若一直出现，说明服务可能正在重启或已停止运行。<br>'+
+      '<span style="color:#8b949e;font-size:12px">技术详情：'+e+'</span></div>';
+  }
+}
+refresh(); setInterval(refresh, 2000);
+</script>
+</body>
+</html>

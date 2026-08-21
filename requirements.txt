@@ -1,0 +1,6 @@
+# HTTP 服务依赖(通过 pip 安装)
+fastapi
+uvicorn[standard]
+
+# 注意: AmazingData SDK(Python 包 "AmazingData")为数据服务商提供的私有包,
+# 不通过 pip 公开分发, 请按服务商指引单独安装后再运行本服务。
