@@ -297,7 +297,7 @@ _RESTARTING = False          # 防止看门狗/请求并发触发多次重启
 _KEEPALIVE_INTERVAL = 180    # 每 3 分钟做一次真实查询保活, 更快发现上游会话掉线
 # 探针最长执行时间: 会话死时 SDK get_calendar 可阻塞 ~150s(2026-08-17 实测), 
 # 超时即判定会话死, 交由 watchdog 判死重启, 不再干等阻塞拖死服务
-_KEEPALIVE_TIMEOUT = 20
+_KEEPALIVE_TIMEOUT = 60
 _LAST_KEEPALIVE = START_TIME
 
 # SDK 并发策略(2026-08-16 压测结论):
