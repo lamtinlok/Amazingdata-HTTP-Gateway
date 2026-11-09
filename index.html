@@ -16,12 +16,15 @@
   .badge { display:inline-block; padding:3px 10px; border-radius:12px; font-size:13px; }
   .ok { background:#1f6f3e; color:#fff; }
   .bad { background:#8b2020; color:#fff; }
-  .logs { background:#010409; border:1px solid #30363d; border-radius:8px; padding:12px;
-          height:340px; overflow:auto; font-size:13px; line-height:1.6; white-space:pre-wrap;
+  .logs { background:#010409; border:1px solid #30363d; border-radius:8px; padding:10px 12px;
+          height:340px; overflow:auto; font-size:13px; line-height:1.35; white-space:pre-wrap;
           font-family: "SF Mono", "Cascadia Code", Consolas, "Menlo", "Courier New", monospace; }
-  .logs div { margin:0; }
+  .logs div { margin:0; padding:0; }
   .logcols { display:flex; gap:12px; }
-  .logcol { flex:1; min-width:0; }
+  .logcol { flex:1 1 0; min-width:0; width:0; }
+  /* 括号里的细节另起一行, 顶格缩进 2 字符 */
+  .logdet { display:block; padding-left:2ch; font-size:12px; color:#8b949e;
+            white-space:normal; word-break:break-word; }
   .loghead { font-size:13px; color:#8b949e; margin-bottom:6px; }
   .sec-title { font-size:13px; color:#8b949e; margin:18px 0 8px; }
   a { color:#58a6ff; }
@@ -117,13 +120,412 @@ async function refresh(){
       : '-';
     // 已渲染状态: 增量追加日志, 不做 innerHTML 整体重建。
     // 整体重建会销毁用户正在选中的 DOM 节点, 导致选区失效/异常扩大(复制时"突然全选")。
+    // ---- 结构化渲染: 时间 | 级别 | 消息(关键字着色) ----
+    // 原版整行一个颜色、又长又折行, 读起来一片蓝。现在拆成三段:
+    //   时间(暗灰, 悬停看完整日期) / 级别(徽章色) / 消息(关键字高亮)
+    // 常态行(session alive 等)整行调暗, 异常行(失败/重启/超时)靠关键字色自然凸显。
+    const LEVEL_COLOR = {INFO:'#58a6ff', WARNING:'#d29922', ERROR:'#f85149',
+                         CRITICAL:'#f85149', DEBUG:'#8b949e'};
+    // 关键字高亮规则: 扫描整段消息, 谁匹配位置靠前谁上色; 同一位置按数组顺序优先
+    const HL_RULES = [
+      [/(probe ok|login ok=True|ok=True|success|recovered|attached|\balive\b)/, '#3fb950'],
+      [/(dead evidence|session dead|restarting|SELF-RESTART|failed|hung|BOTH probes failed|reconnect|-98|crash|refused|rejected|error)/, '#f85149'],
+      [/(TIMEOUT|throttled|skipped|retry|retrying|strike \d\/\d|suspicious|degraded|not ready|stale)/, '#d29922'],
+      [/(took [\d.]+s|total [\d.]+s|in \d+ms|\b\d+\.\d+s\b|\b\d+ms\b)/, '#79c0ff'],
+      // 中文关键词
+      // ws 连接状态词单独上色: 连接=绿, 断开=红, 便于在长日志里一眼扫到客户端进出
+      [/(已连接)/, '#3fb950'],
+      [/(已断开)/, '#f85149'],
+      [/(成功|正常|存活|已释放|恢复)/, '#3fb950'],
+      [/(失败|错误|死亡|拒绝|崩溃|重启)/, '#f85149'],
+      [/(超时|重试|警告|清理|可疑|陈旧|不可读)/, '#d29922'],
+      [/(\d+(?:\.\d+)?(?:毫秒|秒|分钟|小时))/, '#79c0ff'],
+    ];
+    function _span(parent, text, color, bold){
+      const s = document.createElement('span');
+      s.textContent = text;
+      s.style.color = color;
+      if(bold) s.style.fontWeight = '600';
+      parent.appendChild(s);
+    }
+    function _hl(parent, text, base){
+      let rest = text;
+      while(rest.length){
+        let best = null;
+        for(const [re,color] of HL_RULES){
+          const m = re.exec(rest);
+          if(m && (best === null || m.index < best.i)) best = {i:m.index, len:m[0].length, color};
+        }
+        if(!best){ _span(parent, rest, base); return; }
+        if(best.i > 0) _span(parent, rest.slice(0, best.i), base);
+        _span(parent, rest.substr(best.i, best.len), best.color, true);
+        rest = rest.slice(best.i + best.len);
+      }
+    }
+    // ---- 看门狗消息中文化: 主句一行, 括号里的细节另起一行 ----
+    const ZH_METHOD = [
+      [/InfoData\.get_treasury_yield/, '国债收益率'],
+      [/BaseData\.get_calendar/, '交易日历'],
+      [/MarketData\.query_kline/, 'K线'],
+      [/BaseData\.get_stock_basic/, '股票基本信息'],
+      [/MarketData\.query_tick/, '逐笔成交'],
+    ];
+    function zhMethod(s){ for(const [re, z] of ZH_METHOD) if(re.test(s)) return z; return s; }
+    // "probe#1 InfoData.get_treasury_yield" -> "探测#1 国债收益率"
+    function zhProbe(s){
+      const m = String(s).match(/probe#(\d+)\s*(.*)$/);
+      if(!m) return zhMethod(s);
+      return '探测#' + m[1] + ' ' + zhMethod(m[2]);
+    }
+    // 时长/年龄: 48ms->48毫秒, 0.14s->0.14秒, 150s->2.5分钟
+    function zhDur(t){
+      return String(t).replace(/(\d+(?:\.\d+)?)\s*(ms|s|m|h)\b/g, function(_, n, u){
+        const N = parseFloat(n);
+        if(u === 'ms') return N + '毫秒';
+        if(u === 's')  return N >= 60 ? (N / 60).toFixed(1) + '分钟' : N + '秒';
+        if(u === 'm')  return N + '分钟';
+        return N + '小时';
+      });
+    }
+    // 括号内的细节短语
+    function zhParen(s){
+      let out = String(s)
+        .replace(/periodic probe, last started (.+?) ago/g, (_, a) => '周期探测，距上次发起 ' + zhDur(a) + '前')
+        .replace(/releases account connection slot/g, '已释放账号连接槽位')
+        .replace(/new TGW login in _startup_login/g, '将在启动流程里重新登录 TGW')
+        .replace(/logout=(\w+)/g, (_, v) => '登出=' + ({ok:'成功', fail:'失败', timeout:'超时'}[v] || v))
+        .replace(/fds_marked_cloexec=(\d+)/g, (_, v) => '补 CLOEXEC 的 fd=' + v)
+        .replace(/socket_fds_before=(\d+)/g, (_, v) => '清理前 socket fd=' + v)
+        .replace(/\bTIMEOUT\b/g, '超时')
+        .replace(/\bunreadable\b/g, '不可读')
+        .replace(/\bbiz ok\b/g, '业务成功')
+        .replace(/^pre-restart$|pre-restart/g, '重启前')
+        .replace(/^pre-relogin$/, '定时重登前')
+        .replace(/^shutdown$/, '进程退出')
+        .replace(/\bpush\b/g, '推送心跳')
+        .replace(/\bquery\b/g, '查询')
+        .replace(/,\s*/g, ' · ')
+        .replace(/\s*;\s*/g, ' · ');
+      return zhDur(out);
+    }
+    // 每条规则返回 [主句, 细节]; 细节为空则只有主句
+    const WD_ZH = [
+      [/^(?:watchdog: )?session alive \(last probe ok (.+?) ago via probe#(\d+)\s*(\S+); strike (\d+\/\d+); (.+?)\)$/,
+        m => ['会话存活', `上次探针成功 ${zhDur(m[1])}前 · 经探测#${m[2]} ${zhMethod(m[3])} · 异常计数 ${m[4]} · ${zhParen(m[5])}`]],
+      [/^(?:watchdog: )?probe ok via probe#(\d+)\s*(\S+)\s*\(took (.+?),\s*total (.+?)\)$/,
+        m => ['探针成功', `探测#${m[1]} ${zhMethod(m[2])} · 耗时 ${zhDur(m[3])} · 累计 ${zhDur(m[4])}`]],
+      [/^(?:watchdog: )?keepalive probe started \((.+?)\)$/,
+        m => ['发起心跳探针', zhParen(m[1])]],
+      [/^(?:watchdog: )?(probe#\d+ \S+) failed \((\w+), (.+?)\) -> trying (probe#\d+ \S+)$/,
+        m => [`${zhProbe(m[1])} 失败`, `原因 ${zhParen(m[2])} · 耗时 ${zhDur(m[3])} · 改试 ${zhProbe(m[4])}`]],
+      [/^(?:watchdog: )?BOTH probes failed and no business query succeeded within (\d+)s \(last biz ok (.+?) ago\) -> dead evidence (\d+\/\d+) \((.+?)\)$/,
+        m => [`两重探针均失败 · 记死亡证据 ${m[3]}`, `${m[1]}秒内无业务查询成功（上次 ${zhDur(m[2])}前）· ${zhParen(m[4])}`]],
+      [/^(?:watchdog: )?BOTH probes failed BUT a business query succeeded (.+?) ago \(<= (\d+)s grace\) -> upstream is alive, not counting as dead evidence \((.+?)\)$/,
+        m => ['两重探针均失败，但未计死亡证据', `业务查询 ${zhDur(m[1])}前成功（宽限 ${m[2]}秒内）· 上游判定存活 · ${zhParen(m[3])}`]],
+      [/^(?:watchdog: )?session dead for (\d+) consecutive dead evidences \(probe=([^;]+); ([^)]*)\) -> restarting process/,
+        m => [`会话判定死亡 · 连续 ${m[1]} 次死亡证据`, `探针=${zhProbe(m[2])} · ${zhParen(m[3])} · 即将重启进程`]],
+      [/^(?:watchdog: )?no probe verdict yet -> keeping judgement open \(strike (\d+\/\d+); (.+?)\)$/,
+        m => ['尚无探针结论 · 判定保持开放', `异常计数 ${m[1]} · ${zhParen(m[2])}`]],
+      [/^(?:watchdog: )?graceful logout \((.+?)\): (\w+) in (\d+)ms \((.+?)\)$/,
+        m => [`优雅登出${({ok:'成功', fail:'失败', timeout:'超时'}[m[2]] || m[2])}（${zhParen(m[1])}）`,
+               `耗时 ${m[3]}毫秒 · ${zhParen(m[4])}`]],
+      [/^(?:watchdog: )?pre-restart cleanup \((.+?)\): (.+)$/,
+        m => ['重启前清理', `${zhParen(m[1])} · ${zhParen(m[2])}`]],
+      [/^(?:watchdog: )?SELF-RESTART OK: process replaced via execve \((.+?)\)$/,
+        m => ['自愈重启成功', `进程已由 execve 替换 · ${zhParen(m[1])}`]],
+      [/^(?:watchdog: )?tgw keepalive ok.*$/, m => ['TGW 心跳正常', '']],
+      [/^(?:watchdog: )?tgw keepalive failed.*$/, m => ['TGW 心跳失败', '']],
+    ];
+    // 中文化 + 拆行; 未命中的保持原文, 但把末尾长括号拆成第二行
+    function zhWatchdog(msg){
+      for(const [re, f] of WD_ZH){
+        const m = msg.match(re);
+        if(m){ const r = f(m); return {main: r[0], detail: r[1] || ''}; }
+      }
+      // 看门狗线程也会打预加载/订阅类日志(如 "preload: subscription up"、"subscribe: tgw.Subscribe
+      // flag patch installed"), 复用后台规则表, 避免同一个线程两套翻译漏行
+      const hit = zhBackendMatch(msg);
+      if(hit) return hit;
+      const tail = msg.match(/^(.*?)\s*\(([^()]{16,})\)\s*$/);
+      if(tail) return {main: tail[1], detail: zhParen(tail[2])};
+      return {main: msg, detail: ''};
+    }
+
+    // ---- 后端日志中文化: 与看门狗同一套拆行结构, 未命中规则的回退英文原文 ----
+    // 周期字段已按要求不再显示, 故不保留周期名映射
+    const ZH_KV = {enabled:'启用', list:'代码表时间', sub:'订阅时间', types:'标的类型',
+                   now:'立即执行', fetch:'拉表市场', subscribe:'订阅市场'};
+    function zhKV(s){
+      // period 字段整段不显示, 先剔除再翻译, 免得残留 "周期=快照"
+      const t = String(s).replace(/(?:^|\s)period=\S+/g, '');
+      // 值允许逗号列表(fetch=stock,etf,...), 否则会在第一个逗号处截断
+      return t.replace(/(\w+)=([^\s]+?)(?=\s+\w+=|\s*$)/g, function(all, k, v){
+        if(!ZH_KV[k]) return all;
+        if(k === 'fetch' || k === 'subscribe') return ZH_KV[k] + '=' + zhMktList(v);
+        if(k === 'enabled' || k === 'now') return ZH_KV[k] + '=' + zhBool(v);
+        return ZH_KV[k] + '=' + v;
+      });
+    }
+    const ZH_SLOT = {logout:'登出', login:'登录'};
+    function zhSlot(s){ return ZH_SLOT[s] || s; }
+    const ZH_RES = {ok:'成功', fail:'失败', timeout:'超时'};
+    function zhRes(s){ return ZH_RES[s] || s; }
+    const ZH_REASON = {scheduled:'定时重登', watchdog:'看门狗', manual:'手动', rejected:'被拒',
+                       error:'异常', timeout:'超时', login:'重连成功', startup:'启动',
+                       shutdown:'进程退出', 'pre-relogin':'定时重登前',
+                       'pre-restart':'重启前', 'session dead':'会话已死'};
+    function zhReason(s){ return ZH_REASON[s] || s; }
+    function zhBool(s){ return ({'True':'是', 'False':'否', 'true':'是', 'false':'否'})[s] || s; }
+    // ---- v10 多市场: 市场键 -> 中文名; 拉表行/订阅行都要用 ----
+    const ZH_MKT = {stock:'A股', etf:'ETF', index:'指数', kzz:'可转债',
+                    glra:'逆回购', hkt:'港股通', future:'期货', option:'期权'};
+    // 老格式拉表行只打 security_type, 也要认得
+    const ZH_TYPE = {EXTRA_STOCK_A:'A股', EXTRA_ETF:'ETF', EXTRA_INDEX_A:'指数',
+                     EXTRA_KZZ:'可转债', EXTRA_GLRA:'逆回购', EXTRA_HKT:'港股通',
+                     EXTRA_FUTURE:'期货', EXTRA_ETF_OP:'期权'};
+    const MKT_ORDER = ['stock','etf','index','kzz','glra','hkt','future','option'];
+    function zhMkt(s){ return ZH_MKT[s] || ZH_TYPE[s] || s; }
+    // "stock,etf,index,glra" -> "A股+ETF+指数+逆回购"
+    function zhMktList(s){
+      const keys = String(s).split(',').map(x => x.trim()).filter(Boolean);
+      keys.sort(function(a, b){
+        const ia = MKT_ORDER.indexOf(a), ib = MKT_ORDER.indexOf(b);
+        return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+      });
+      return keys.map(zhMkt).join('+');
+    }
+    // "etf=1658, future=816, ..." -> "A股 5579 · ETF 1658 · ..."(按固定市场顺序)
+    function zhMktCounts(s){
+      const items = String(s).split(',').map(x => x.trim()).filter(Boolean).map(function(kv){
+        const p = kv.split('=');
+        return {k: p[0], v: p[1], raw: kv, zh: zhMkt(p[0])};
+      });
+      items.sort(function(a, b){
+        const ia = MKT_ORDER.indexOf(a.k), ib = MKT_ORDER.indexOf(b.k);
+        return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+      });
+      return items.map(function(it){ return it.v ? it.zh + ' ' + it.v : it.raw; }).join(' · ');
+    }
+    // 拉表累计耗时统一按秒显示, 免得 96.1秒 与 1.9分钟 混着出现
+    function zhElapsed(t){
+      const m = String(t).match(/^(\d+(?:\.\d+)?)\s*s$/);
+      return m ? parseFloat(m[1]).toFixed(1) + ' 秒' : zhDur(t);
+    }
+    // 异常文本里的常见英文短语
+    function zhErr(s){
+      return String(s)
+        .replace(/timeout after (\d+(?:\.\d+)?)s/g, '超时 $1秒')
+        .replace(/connection refused/gi, '连接被拒绝')
+        .replace(/not ready/gi, '未就绪')
+        .replace(/timed out/gi, '已超时');
+    }
+
+    const BK_ZH = [
+      // ---- 客户端 WebSocket ----
+      [/^ws client attached: (\S+) n=all period=(\S+) \(universe=(\d+)\) codes=ALL$/,
+        m => ['ws://' + m[1] + '已连接 · 全市场全推',
+              '股票池 ' + m[3] + ' 只 · 每条 tick 都转发']],
+      [/^ws client attached: (\S+) n=(\d+) period=(\S+) \(universe=(\d+)\)(?:\s*codes=(.*))?$/,
+        m => ['ws://' + m[1] + '已连接 · ' + (m[2] === '0' ? '握手完成，尚未订阅' : '订阅 ' + m[2] + ' 只'),
+              '股票池 ' + m[4] + ' 只' + (m[2] === '0' || !m[5] ? '' : ' · 代码 ' + m[5])]],
+      [/^ws add all -> .*universe=(\d+)\)$/, m => ['ws切换为全市场全推', '股票池 ' + m[1] + ' 只']],
+      [/^ws add \(all mode\) un-excluded=(.*)$/, m => ['ws解除屏蔽(全推中)', '代码 ' + m[1]]],
+      [/^ws remove all -> .*$/, () => ['ws关闭全市场全推', '本连接不再接收任何 tick']],
+      [/^ws remove codes=(.*) \(all mode, excluded\)$/, m => ['ws屏蔽代码(全推中)', '不再推 ' + m[1]]],
+      [/^ws add rejected \(not in universe\):\s*(.+)$/,
+        m => ['ws追加订阅被拒 · 全推数据中无此代码', m[1]]],
+      [/^ws add codes=(.*)$/, m => ['ws添加订阅成功', '代码 ' + m[1]]],
+      [/^ws remove codes=(.*)$/, m => ['ws退订成功', '代码 ' + m[1]]],
+      [/^ws subscribe rejected:\s*(.+)$/, m => ['ws订阅被拒', m[1]]],
+      [/^ws subscribe:\s*(\d+) codes not in universe:\s*(.+)$/,
+        m => ['ws订阅请求中有 ' + m[1] + ' 只不在全市场表内', m[2]]],
+      [/^ws client disconnected:\s*([\w.\-]+:\d+)$/,
+        m => ['ws://' + m[1] + '已断开', '']],
+      [/^ws client disconnected:\s*(.+)$/, m => ['ws客户端已断开', m[1]]],
+      [/^ws client disconnected$/, () => ['ws客户端已断开', '']],
+      [/^ws send skipped \(client gone\):\s*(.+)$/, m => ['ws跳过发送 · 客户端已离开', m[1]]],
+      [/^ws send error:\s*(.+)$/, m => ['ws发送异常', m[1]]],
+      [/^ws handler error:\s*(.+)$/, m => ['ws处理异常', m[1]]],
+      // ---- 预加载与全市场订阅(v10 多市场) ----
+      // global subscription started: n_codes=7891 markets=stock,etf,index,glra period=snapshot groups=4/4 gen=1 session_ts=...
+      [/^global subscription started: n_codes=(\d+)(?: markets=(\S+))? period=(\S+)(?: groups=(\S+))? gen=(\S+) session_ts=(\S+)$/,
+        m => ['全局订阅已启动' + (m[2] ? ' · ' + zhMktList(m[2]) : ''),
+              m[1] + ' 只' + (m[4] ? ' · 分组 ' + m[4] : '') + ' · 代号 ' + m[5]]],
+      // preload: restored 11734 codes from cache (date=2026-11-09, markets=etf,...,option)
+      [/^preload: restored (\d+) codes from cache \(date=([^,)]+)(?:, markets=([^)]*))?\).*$/,
+        m => ['预加载 · 从缓存恢复 ' + m[1] + ' 只代码',
+              '代码表日期 ' + m[2] +
+              (m[3] === undefined ? ''
+                : m[3] === '-' ? ' · 旧格式缓存，稍后重拉多市场表'
+                : ' · ' + zhMktList(m[3]))]],
+      // preload: stock  EXTRA_STOCK_A  ->  5579 codes (18.1s) / 旧格式 preload: EXTRA_ETF -> 1658 codes (47.7s)
+      [/^preload: (\S+?)(?:\s+(\S+))?\s*->\s*(\d+) codes\s*\((.+?)\)$/,
+        m => ['预加载 · ' + zhMkt(m[1]) + ' 代码表已就绪',
+              m[3] + ' 只 · 累计 ' + zhElapsed(m[4])]],
+      // preload: universe ready, 11734 codes / 8 markets in 116.0s (etf=1658, future=816, ...)
+      [/^preload: universe ready, (\d+) codes \/ (\d+) markets in (\S+?) \((.+)\)$/,
+        m => ['预加载 · ' + m[2] + ' 个市场代码表全部就绪 · ' + m[1] + ' 只',
+              '耗时 ' + zhElapsed(m[3]) + ' · ' + zhMktCounts(m[4])]],
+      [/^preload: universe ready, (\d+) codes in (.+)$/,
+        m => ['预加载 · 全市场代码表就绪', m[1] + ' 只 · 耗时 ' + zhElapsed(m[2])]],
+      // preload: subscription up, 7891 codes, markets=stock,etf,index,glra period=snapshot
+      [/^preload: subscription up, (\d+) codes, markets=(\S+) period=(\S+)$/,
+        m => ['预加载 · 订阅已就绪', m[1] + ' 只 · ' + zhMktList(m[2])]],
+      [/^preload: subscription up, (\d+) codes, period=(\S+)$/,
+        m => ['预加载 · 订阅已就绪', m[1] + ' 只']],
+      [/^subscribe: tgw\.Subscribe flag patch installed$/,
+        () => ['订阅 · 已补全 flag 映射', '港股通/期权/逆回购的 SubscribeDataType 已修正']],
+      [/^preload: rebuilding subscription \(stale_session=(.+?) thread_dead=(.+?)\)$/,
+        m => ['预加载 · 重建订阅', '会话过期=' + zhBool(m[1]) + ' · 线程死亡=' + zhBool(m[2])]],
+      [/^preload: no tick for (\d+)s in trading window -> restart \(heal (\d+)\/3 today\)$/,
+        m => ['预加载 · 交易时段 ' + m[1] + ' 秒无 tick → 重启自愈', '今日第 ' + m[2] + '/3 次']],
+      [/^preload: still no tick after heals, quota exhausted today$/,
+        () => ['预加载 · 自愈后仍无 tick', '今日自愈次数已用尽']],
+      [/^preload thread started \((.+)\)$/, m => ['预加载线程已启动', zhKV(m[1])]],
+      [/^preload: (cache load failed|BaseData\(\) failed|get_code_list\([^)]*\) failed|cache save failed):\s*(.+)$/,
+        m => ['预加载失败 · ' + m[1], m[2]]],
+      [/^preload: unknown period (\S+), skip$/,
+        m => ['预加载 · 未知周期，跳过', '周期 ' + m[1]]],
+      [/^preload loop error:\s*(.+)$/, m => ['预加载循环异常', m[1]]],
+      [/^preload thread dispatch failed:\s*(.+)$/, m => ['预加载线程派发失败', m[1]]],
+      [/^subscribe restart triggered: new codes=(.*)$/,
+        m => ['触发重启以扩大订阅集合', '新增代码 ' + m[1]]],
+      // ---- local_data 缓存清理(每次重连后) ----
+      [/^local cache cleaned \((.+?)\):\s*(.+)$/,
+        m => ['local_data 缓存已清理 · ' + zhReason(m[1]), m[2]]],
+      [/^local cache clean thread error:\s*(.+)$/, m => ['缓存清理线程异常', m[1]]],
+      [/^local cache clean dispatch failed:\s*(.+)$/, m => ['缓存清理派发失败', m[1]]],
+      // ---- 启动与登录 ----
+      [/^startup login ok=True \(verified by get_calendar, calendar cached\)$/,
+        () => ['启动登录成功', '交易日历校验通过 · 日历已缓存']],
+      [/^startup login error:\s*(.+)$/, m => ['启动登录失败', m[1]]],
+      [/^initial TGW login dispatched to background thread \(port binds immediately\)$/,
+        () => ['已在后台线程发起首次 TGW 登录', '端口已先行监听']],
+      [/^in-process login retry ok \(upstream recovered\)$/,
+        () => ['进程内重试登录成功', '上游已恢复']],
+      [/^login attempt WEDGED \(>(\d+)s, thread stuck in ad\.login\/get_calendar\) -> restarting process$/,
+        m => ['登录线程卡死 → 重启进程', '超过 ' + m[1] + ' 秒未返回（卡在 ad.login/get_calendar）']],
+      [/^login attempt failed \(([^)]*)\), strike (\d+\/\d+)$/,
+        m => ['登录失败', '原因 ' + zhReason(m[1]) + ' · 异常计数 ' + m[2]]],
+      [/^login failed (\d+) consecutive times -> restarting process$/,
+        m => ['连续 ' + m[1] + ' 次登录失败 → 重启进程', '']],
+      [/^CONTINUE after watchdog recovery restart \(service uptime preserved\)$/,
+        () => ['看门狗恢复重启后继续运行', '服务运行时间未归零']],
+      [/^SELF-RESTART OK: process replaced via execve \((.+?)\)$/,
+        m => ['自愈重启成功', '进程已由 execve 替换 · ' + zhParen(m[1])]],
+      [/^watchdog started$/, () => ['看门狗已启动', '']],
+      [/^watchdog: initial login in progress, skip judgement$/,
+        () => ['看门狗 · 首次登录进行中，本轮跳过判定', '']],
+      [/^watchdog: scheduled relogin window, skip judgement$/,
+        () => ['看门狗 · 处于定时重登窗口，跳过判定', '']],
+      // ---- 定时重登 ----
+      [/^scheduled relogin thread started:\s*(.+?)\s*\(in-process, uptime preserved\)$/,
+        m => ['定时重登线程已启动 · 进程内执行', m[1].replace(/->/g, '→') + ' · 运行时间不归零']],
+      [/^scheduled relogin thread dispatched \((.+?), in-process\)$/,
+        m => ['定时重登线程已派发（进程内执行）', m[1].replace(/->/g, '→')]],
+      [/^schedule: next (\w+) at (\S+ \S+)\s*(?:\(paired login (\S+)\))?$/,
+        m => ['下次日程 · ' + zhSlot(m[1]), '时间 ' + m[2] + (m[3] ? ' · 配对登录 ' + m[3] : '')]],
+      [/^scheduled logout done \((.+?)\); login suppressed until (\S+)$/,
+        m => ['定时登出完成', '时间 ' + m[1] + ' · ' + m[2] + ' 前不再发起登录']],
+      [/^scheduled login ok \((.+?)\)$/, m => ['定时登录成功', '时间 ' + m[1]]],
+      [/^scheduled login WEDGED \((.+?)\) -> restart via retry loop$/,
+        m => ['定时登录卡死 → 交由重试线程重启', '时间 ' + m[1]]],
+      [/^scheduled login failed \((.+?)\) -> handing to retry loop$/,
+        m => ['定时登录失败 → 交由重试线程处理', '时间 ' + m[1]]],
+      [/^scheduled relogin loop error:\s*(.+)$/, m => ['定时重登循环异常', m[1]]],
+      [/^relogin: bad slot (.+?) ignored \(expect HH:MM or HH:MM-HH:MM\)$/,
+        m => ['重登配置 · 忽略非法时间项', m[1]]],
+      // ---- 登出与重启 ----
+      [/^graceful logout \((.+?)\): (\w+) in (\d+)ms \((.+?)\)$/,
+        m => ['优雅登出 · ' + zhRes(m[2]), '原因 ' + zhReason(m[1]) + ' · 耗时 ' + m[3] + ' 毫秒 · ' + zhParen(m[4])]],
+      [/^graceful logout \((.+?)\) thread start failed:\s*(.+)$/,
+        m => ['优雅登出线程启动失败', '原因 ' + m[1] + ' · ' + m[2]]],
+      [/^pre-restart cleanup \((.+?)\): (.+)$/,
+        m => ['重启前清理', '原因 ' + m[1] + ' · ' + zhParen(m[2])]],
+      [/^restart skipped \(initial login still in progress\)$/,
+        () => ['已跳过重启', '首次登录仍在进行']],
+      [/^restart skipped \(process too young\)$/,
+        () => ['已跳过重启', '进程启动时间过短']],
+      [/^restart throttled \(cooldown active\), in-process retry handling recovery$/,
+        () => ['重启被限流（冷却期内）', '改由进程内重试恢复']],
+      [/^session dead -> restarting process for a fresh TGW login/,
+        () => ['会话已死 → 重启进程以重新登录 TGW', '']],
+      [/^restart failed:\s*(.+)$/, m => ['重启失败', m[1]]],
+      // ---- 查询与杂项 ----
+      [/^query ([\w.]+) rejected: initial login not ready$/,
+        m => ['查询被拒 · 首次登录尚未就绪', m[1]]],
+      [/^query ([\w.]+) base-exception:\s*(.+)$/, m => ['查询底层异常', m[1] + ' · ' + zhErr(m[2])]],
+      [/^query ([\w.]+) error:\s*(.+)$/, m => ['查询异常', m[1] + ' · ' + zhErr(m[2])]],
+      [/^request logging attached to req buffer$/, () => ['请求日志已接入请求缓冲', '']],
+      [/^attach access logger failed:\s*(.+)$/, m => ['接入访问日志失败', m[1]]],
+    ];
+    // BK_ZH 命中即返回, 不命中返回 null(供看门狗栏复用, 避免走英文回退)
+    function zhBackendMatch(msg){
+      for(const [re, f] of BK_ZH){
+        const m = msg.match(re);
+        if(m){ const r = f(m); return {main: r[0], detail: r[1] || ''}; }
+      }
+      return null;
+    }
+    function zhBackend(msg){
+      const hit = zhBackendMatch(msg);
+      if(hit) return hit;
+      // 未命中: 保留英文原文, 仅把过长的括号细节拆到第二行(与看门狗栏一致)
+      const tail = msg.match(/^(.*?)\s*\(([^()]{16,})\)\s*$/);
+      if(tail) return {main: tail[1], detail: tail[2]};
+      return {main: msg, detail: ''};
+    }
+
+    // uvicorn access 行: INFO:  1.2.3.4:5678 - "POST /api/query HTTP/1.1" 200 OK
+    const ACCESS_RE = /^INFO:\s+(\S+)\s+-\s+"([A-Z]+)\s+(\S+)([^"]*)"\s+(\d+)(.*)$/;
     function appendLine(box, l, stripWd){
-      // 看门狗视图只保留消息本体, 不显示来源标签与前缀
-      if(stripWd) l = l.replace(/\[watchdog\]\s*/gi, '').replace(/watchdog:\s*/gi, '');
       const d = document.createElement('div');
-      d.style.color = logColor(l);
-      d.textContent = l;   // textContent 自动转义, 替代原 esc()
+      let msg = l;
+      // [backend] 是服务进程本体的默认标签, 三栏里都不显示(冗余); [watchdog] 保留可见
+      msg = msg.replace(/\[backend\]\s*/gi, '');
+      // 看门狗栏保留 [watchdog] 标签, 但去掉消息里重复的 "watchdog: " 前缀
+      if(stripWd === 'wd') msg = msg.replace(/watchdog:\s*/gi, '');
+      const am = msg.match(ACCESS_RE);
+      if(am){
+        _span(d, am[1]+' ', '#6e7681');
+        _span(d, am[2], '#79c0ff', true);
+        _span(d, ' '+am[3]+am[4]+'  ', '#c9d1d9');
+        const code = parseInt(am[5], 10);
+        _span(d, am[5], code < 400 ? '#3fb950' : (code < 500 ? '#d29922' : '#f85149'), true);
+        _span(d, am[6], '#8b949e');
+        box.appendChild(d);
+        return;
+      }
+      const m = msg.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+([A-Z]+)\s*(?:\[([a-z-]+)\]\s*)?(.*)$/);
+      if(!m){ d.style.color = '#8b949e'; d.textContent = msg; box.appendChild(d); return; }
+      const ts = m[1], lvl = m[2], cat = m[3], rest = m[4];
+      const t = document.createElement('span');
+      t.textContent = ts.slice(11) + ' ';          // 只显示 HH:MM:SS, 日期悬停可见
+      t.style.color = '#6e7681'; t.title = ts;
+      d.appendChild(t);
+      const lv = document.createElement('span');
+      // 级别名压缩(INFO/WARN/ERR/CRIT), 纯文本流式排版: 时间 空格 级别 空格 消息, 无任何定宽
+      const lvName = ({WARNING:'WARN', ERROR:'ERR', CRITICAL:'CRIT'})[lvl] || lvl;
+      lv.textContent = lvName;
+      lv.style.color = LEVEL_COLOR[lvl] || '#8b949e';
+      d.appendChild(lv);
+      // 来源标签([watchdog]/[backend])不再渲染: 栏目本身已区分来源, 标签纯冗余
+      let base = '#c9d1d9';
+      if(lvl === 'WARNING') base = '#d29922';
+      else if(lvl === 'ERROR' || lvl === 'CRITICAL') base = '#f85149';
+      else if(/会话存活|发起心跳探针|探针成功|尚无探针结论|request logging attached/.test(rest))
+        base = '#7d8590';   // 常态心跳/例行行调暗, 异常自然凸显
+      const zh = stripWd === 'wd' ? zhWatchdog(rest)
+               : stripWd === 'bk' ? zhBackend(rest)
+               : {main: rest, detail: ''};
+      _hl(d, ' ' + zh.main, base);
       box.appendChild(d);
+      if(zh.detail){
+        const det = document.createElement('span');
+        det.className = 'logdet';
+        _hl(det, '└ ' + zh.detail, '#8b949e');
+        box.appendChild(det);
+      }
     }
     function fill(boxId, logs, stripWd){
       const box = document.getElementById(boxId);
@@ -148,18 +550,8 @@ async function refresh(){
         box.scrollTop = box.scrollHeight;
       }
     }
-    // 按日志级别着色: ERROR 红 / WARNING 黄 / INFO 蓝 / 其他灰
-    function logColor(l){
-      if(l.indexOf('ws client disconnected')>=0) return '#d29922';
-      if(l.indexOf('ws client attached')>=0) return '#3fb950';
-      if(l.indexOf('tgw keepalive ok')>=0) return '#3fb950';
-      if(l.indexOf('ERROR')>=0 || l.indexOf('tgw keepalive failed')>=0) return '#f85149';
-      if(l.indexOf('WARNING')>=0) return '#d29922';
-      if(l.indexOf('INFO')>=0) return '#58a6ff';
-      return '#8b949e';
-    }
-    fill('logs-watchdog', s.logs_watchdog || [], true);
-    fill('logs-backend', s.logs_backend || s.logs || []);
+    fill('logs-watchdog', s.logs_watchdog || [], 'wd');
+    fill('logs-backend', s.logs_backend || s.logs || [], 'bk');
     fill('logs-request', s.logs_request || []);
   }catch(e){
     const box=document.getElementById('logs-backend');
