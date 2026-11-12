@@ -2482,7 +2482,25 @@ def _preload_loop():
             # 3) 零推送自愈: 交易时段内订阅在跑、却持续 3 轮(30s) 没有任何 tick,
             #    说明流可能"连上了但收不到"(2026-09-22 那类静默故障) -> 重启进程重登重订。
             #    注意只在有行情的时段判, 午休/收盘后本来就没推送。
-            if _in_trading_window(now.time()) and _SUB["instance"] is not None:
+            # 3.0) 交易时段边沿重置(2026-11-12 修): 集合竞价(09:15-09:30)与午休期间
+            #      上游不推 tick, last_tick_ts 必然是陈旧的; 若不在进入时段的第一轮
+            #      重新起算, 09:30:00 第一轮就读到 age≈900s, 连续 3 轮即误判为静默,
+            #      开盘 20 秒后 execve 自愈重启(11-09/11-10/11-12 每天 09:30:20 "no tick
+            #      for 920s"). 重置后仍需连续 180s 无 tick 才判死, 真静默检测不受影响.
+            _win_now = _in_trading_window(now.time())
+            if _win_now and not _PRELOAD.get("win_prev"):
+                if _SUB["instance"] is not None:
+                    _last_tick = _SUB["last_tick_ts"]
+                    _prev_age = (time.time() - _last_tick) if _last_tick else 0
+                    _SUB["last_tick_ts"] = time.time()
+                    _PRELOAD["zero_streak"] = 0
+                    log("preload: trading window opened -> zero-tick clock reset "
+                        "(stale age was %.0fs, grace 180s)" % _prev_age,
+                        cat="watchdog")
+                else:
+                    _PRELOAD["zero_streak"] = 0
+            _PRELOAD["win_prev"] = _win_now
+            if _win_now and _SUB["instance"] is not None:
                 last = _SUB["last_tick_ts"]
                 age = time.time() - last if last else 0
                 if last and age > 180:
